@@ -6,6 +6,13 @@ const crypto = require('crypto');
 const express = require('express');
 const { locate, CONTEXT_LEN } = require('./lib/match');
 const { computeOverlapGroups } = require('./lib/overlap');
+const {
+  REVIEW_DECISIONS,
+  reviewBinding,
+  getValidReview,
+  pruneInvalidReviews,
+  reviewCounts,
+} = require('./lib/review');
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -36,6 +43,7 @@ function saveDoc(doc) {
 }
 
 function summary(doc) {
+  const counts = reviewCounts(doc); // 仅统计当前有效的复核，旧结论已失效时不计入
   return {
     id: doc.id,
     title: doc.title,
@@ -43,6 +51,8 @@ function summary(doc) {
     updatedAt: doc.updatedAt,
     annotationCount: doc.annotations.length,
     pendingCount: doc.annotations.filter((a) => a.status === 'pending').length,
+    approvedCount: counts.approved,
+    changesCount: counts.changes,
     hasOldText: Boolean(doc.oldText),
     hasNewText: Boolean(doc.newText),
   };
@@ -57,11 +67,22 @@ function resetMigration(a) {
 }
 
 /**
- * 返回给前端的文稿视图：附带按当前位置即时计算的重叠冲突组。
+ * 返回给前端的文稿视图：附带按当前位置即时计算的重叠冲突组与有效复核计数。
  * 派生数据不写入磁盘，每次迁移、人工定位或任何位置变动后随响应重新计算。
+ * 失效的旧复核（如直接改动了磁盘 JSON）不展示、不计入；正式清除在写操作时落盘。
  */
 function docJson(doc) {
-  return { ...doc, overlapGroups: computeOverlapGroups(doc.annotations) };
+  const annotations = doc.annotations.map((a) =>
+    a.review && !getValidReview(doc, a) ? { ...a, review: null } : a
+  );
+  const view = { ...doc, annotations };
+  const counts = reviewCounts(view);
+  return {
+    ...view,
+    overlapGroups: computeOverlapGroups(annotations),
+    approvedCount: counts.approved,
+    changesCount: counts.changes,
+  };
 }
 
 function notFound(res) {
@@ -134,6 +155,7 @@ app.put('/api/documents/:id/old', (req, res) => {
     resetMigration(a);
     return true;
   });
+  pruneInvalidReviews(doc); // 原文与位置已变，旧复核一律失效
   saveDoc(doc);
   res.json({ doc: docJson(doc), dropped });
 });
@@ -194,6 +216,7 @@ app.put('/api/documents/:id/new', (req, res) => {
   }
   doc.newText = newText;
   doc.annotations.forEach(resetMigration);
+  pruneInvalidReviews(doc); // 新稿全文已替换，所有旧复核失效
   saveDoc(doc);
   res.json(docJson(doc));
 });
@@ -211,6 +234,9 @@ app.post('/api/documents/:id/migrate', (req, res) => {
     a.newEnd = r.newEnd;
     a.candidates = r.candidates;
   }
+  // 结果与上次完全相同（状态、区间及各绑定值未变）时保留复核结论；
+  // 任一绑定值改变（如被重新定位到新位置、变为待处理）则自动清除旧结论。
+  pruneInvalidReviews(doc);
   saveDoc(doc);
   res.json(docJson(doc));
 });
@@ -235,6 +261,38 @@ app.put('/api/documents/:id/annotations/:aid/position', (req, res) => {
   a.newEnd = end;
   a.status = 'manual';
   a.reason = 'human';
+  // 指定到完全相同的区间时保留结论；位置一旦改变，旧核准立即清除
+  pruneInvalidReviews(doc);
+  saveDoc(doc);
+  res.json(docJson(doc));
+});
+
+// 人工复核签收：把已定位 / 人工指定的批注标记为「已核准」或「需调整」，
+// 结论绑定当时的新稿全文、批注原文与内容、迁移状态及新区间。
+app.put('/api/documents/:id/annotations/:aid/review', (req, res) => {
+  const doc = loadDoc(req.params.id);
+  if (!doc) return notFound(res);
+  const a = doc.annotations.find((x) => x.id === req.params.aid);
+  if (!a) return res.status(404).json({ error: '批注不存在' });
+  // 待处理、未迁移批注没有确定位置，不能核准/签收
+  if (
+    (a.status !== 'matched' && a.status !== 'manual') ||
+    !Number.isInteger(a.newStart) ||
+    !Number.isInteger(a.newEnd)
+  ) {
+    return res.status(400).json({ error: '待处理、未迁移批注不能复核，请先确定新稿位置' });
+  }
+  const decision = req.body && req.body.decision;
+  if (!REVIEW_DECISIONS.includes(decision)) {
+    return res.status(400).json({ error: '复核结论须为「已核准」或「需调整」' });
+  }
+  const note = String((req.body && req.body.note) || '').trim();
+  a.review = {
+    decision,
+    note,
+    at: new Date().toISOString(),
+    binding: reviewBinding(doc, a),
+  };
   saveDoc(doc);
   res.json(docJson(doc));
 });

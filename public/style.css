@@ -157,7 +157,41 @@ mark.flash { outline: 2px solid #fa8c16; }
 .result-card.st-manual { border-left-color: #1677ff; }
 .result-card.st-pending { border-left-color: #faad14; }
 .result-card.st-unmigrated { border-left-color: #bfbfbf; }
+.result-card.rv-card-approved { background: #f6ffed; }
+.result-card.rv-card-changes { background: #fff7e6; }
 .result-card.flash { outline: 2px solid #fa8c16; }
+
+/* ---------- 人工复核签收 ---------- */
+
+.badge-review-approved { background: #f6ffed; color: #237804; border: 1px solid #b7eb8f; }
+.badge-review-changes { background: #fff7e6; color: #ad4e00; border: 1px solid #ffd591; }
+
+.review-summary {
+  font-size: 13px;
+  margin-bottom: 10px;
+  padding: 6px 10px;
+  background: #f6f8fa;
+  border-radius: 6px;
+}
+.review-summary .hint { margin-left: 8px; }
+.rv-text-approved { color: #237804; }
+.rv-text-changes { color: #ad4e00; }
+
+.review-box {
+  border-top: 1px dashed #d1d5da;
+  margin-top: 8px;
+  padding-top: 8px;
+}
+.review-locked { font-style: normal; }
+.review-box.rv-approved { background: #f6ffed; border: 1px solid #b7eb8f; border-radius: 6px; padding: 8px; }
+.review-box.rv-changes { background: #fff7e6; border: 1px solid #ffd591; border-radius: 6px; padding: 8px; }
+.review-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.review-note { font-size: 13px; margin: 6px 0 4px; word-break: break-word; }
+.review-form textarea { margin-bottom: 6px; }
+button.btn-approved { background: #52c41a; border-color: #52c41a; }
+button.btn-approved:hover { background: #389e0d; }
+button.btn-changes { background: #fa8c16; border-color: #fa8c16; }
+button.btn-changes:hover { background: #d46b08; }
 
 .candidate {
   display: block;
