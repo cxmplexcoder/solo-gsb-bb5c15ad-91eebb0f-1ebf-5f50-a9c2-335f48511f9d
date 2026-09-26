@@ -105,7 +105,10 @@ async function refreshDocList(selectId) {
   const docs = await api('GET', '/api/documents');
   const sel = $('docSelect');
   sel.innerHTML = docs
-    .map((d) => `<option value="${d.id}">${escapeHtml(d.title)}（批注 ${d.annotationCount}）</option>`)
+    .map((d) => {
+      const rs = d.reviewStats || { approved: 0, needsAdjustment: 0 };
+      return `<option value="${d.id}">${escapeHtml(d.title)}（批注 ${d.annotationCount} · 核准 ${rs.approved} · 调整 ${rs.needsAdjustment}）</option>`;
+    })
     .join('');
   if (selectId && docs.some((d) => d.id === selectId)) sel.value = selectId;
   return docs;
@@ -180,6 +183,12 @@ const REASON_LABEL = {
   ambiguous: '多处出现且前后文相近，需人工选择',
   human: '由人工指定位置',
 };
+const VERDICT_LABEL = {
+  approved: '已核准',
+  needs_adjustment: '需调整',
+};
+// 仅已定位/人工指定的批注可复核；待处理、未迁移不能核准
+const REVIEWABLE_STATUS = ['matched', 'manual'];
 
 function snippet(text, start, end) {
   const before = text.slice(Math.max(0, start - 15), start);
@@ -193,6 +202,7 @@ function renderResults() {
   if (!doc) return;
   const text = doc.newText || '';
   hideOverlapPicker();
+  renderReviewStats();
 
   // 左栏：新稿 + 高亮（重叠段不跳过后续批注，点击可逐条查看）
   const marks = doc.annotations
@@ -247,6 +257,7 @@ function renderResults() {
           <div class="ops">
             <button class="ghost small" data-manual="${a.id}">手动定位</button>
           </div>
+          ${reviewBlock(a)}
         </div>`;
     })
     .join('') || '<p class="hint">暂无批注。</p>';
@@ -265,8 +276,83 @@ function renderResults() {
       await setPosition(btn.dataset.aid, Number(btn.dataset.start), Number(btn.dataset.end));
     });
   });
+  $('resultList').querySelectorAll('[data-review]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      const aid = btn.dataset.review;
+      const input = $('resultList').querySelector(`[data-note="${aid}"]`);
+      try {
+        state.doc = await api(
+          'PUT',
+          `/api/documents/${state.doc.id}/annotations/${aid}/review`,
+          { verdict: btn.dataset.verdict, note: input ? input.value : '' }
+        );
+        renderResults();
+        await refreshDocList(state.doc.id);
+        saved();
+        toast(`已标记为「${VERDICT_LABEL[btn.dataset.verdict]}」`);
+      } catch (e) {
+        alert(e.message);
+      }
+    });
+  });
+  $('resultList').querySelectorAll('[data-unreview]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      try {
+        state.doc = await api(
+          'DELETE',
+          `/api/documents/${state.doc.id}/annotations/${btn.dataset.unreview}/review`
+        );
+        renderResults();
+        await refreshDocList(state.doc.id);
+        saved();
+        toast('复核结论已撤销');
+      } catch (e) {
+        alert(e.message);
+      }
+    });
+  });
 
   renderOverlapGroups();
+}
+
+// ---------- 人工复核签收 ----------
+
+/** 当前有效的复核数量统计条（随每个文稿接口响应即时重算） */
+function renderReviewStats() {
+  const s = (state.doc && state.doc.reviewStats) || {
+    approved: 0,
+    needsAdjustment: 0,
+    unreviewed: 0,
+  };
+  $('reviewStats').innerHTML =
+    `<span class="badge badge-approved">已核准 ${s.approved}</span>` +
+    `<span class="badge badge-needs_adjustment">需调整 ${s.needsAdjustment}</span>` +
+    `<span class="badge badge-unreviewed">待复核 ${s.unreviewed}</span>` +
+    '<span class="hint">复核结论绑定当时的新稿与定位，任一变动即自动作废</span>';
+}
+
+/** 结果卡片的复核区：可复核批注显示结论、备注与签收按钮，其余提示不可复核 */
+function reviewBlock(a) {
+  if (!REVIEWABLE_STATUS.includes(a.status)) {
+    return '<div class="hint review-locked">待处理 / 未迁移的批注不能复核，请先定位。</div>';
+  }
+  const rv = a.review || null;
+  const head = rv
+    ? `<span class="badge badge-${rv.verdict}">${VERDICT_LABEL[rv.verdict] || rv.verdict}</span>
+       <span class="hint">${new Date(rv.reviewedAt).toLocaleString()}</span>
+       ${rv.note ? `<span class="review-note-text">${escapeHtml(rv.note)}</span>` : ''}`
+    : '<span class="hint">未复核</span>';
+  return `
+    <div class="review-box">
+      <div class="review-head">${head}</div>
+      <div class="review-ops">
+        <input class="review-note" data-note="${a.id}" placeholder="复核备注（可选）"
+               value="${rv ? escapeHtml(rv.note || '') : ''}">
+        <button class="small" data-review="${a.id}" data-verdict="approved">已核准</button>
+        <button class="small warn" data-review="${a.id}" data-verdict="needs_adjustment">需调整</button>
+        ${rv ? `<button class="ghost small" data-unreview="${a.id}">撤销复核</button>` : ''}
+      </div>
+    </div>`;
 }
 
 // ---------- 重叠复核 ----------
@@ -396,6 +482,7 @@ async function setPosition(aid, start, end) {
   state.manualFor = null;
   $('manualBanner').classList.add('hidden');
   renderResults();
+  await refreshDocList(state.doc.id);
   saved();
   toast('位置已保存');
 }
@@ -403,6 +490,7 @@ async function setPosition(aid, start, end) {
 async function migrate() {
   state.doc = await api('POST', `/api/documents/${state.doc.id}/migrate`);
   renderResults();
+  await refreshDocList(state.doc.id);
   saved();
   const matched = state.doc.annotations.filter((a) => a.status === 'matched').length;
   const pending = state.doc.annotations.filter((a) => a.status === 'pending').length;
@@ -445,6 +533,7 @@ $('btnSaveOld').addEventListener('click', async () => {
     renderOldView();
     renderAnnotList();
     renderResults();
+    await refreshDocList(state.doc.id);
     saved();
     $('oldMsg').textContent = dropped ? `已保存；${dropped} 条批注因超出新文稿范围被移除` : '已保存';
     toast('旧稿已保存');

@@ -6,6 +6,13 @@ const crypto = require('crypto');
 const express = require('express');
 const { locate, CONTEXT_LEN } = require('./lib/match');
 const { computeOverlapGroups } = require('./lib/overlap');
+const {
+  VERDICTS,
+  bindingOf,
+  reconcileReviews,
+  reviewStats,
+  isReviewable,
+} = require('./lib/review');
 
 const PORT = process.env.PORT || 3000;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -27,10 +34,21 @@ function loadDoc(id) {
   if (!/^[a-f0-9]{16}$/.test(id)) return null;
   const f = docFile(id);
   if (!fs.existsSync(f)) return null;
-  return JSON.parse(fs.readFileSync(f, 'utf8'));
+  const doc = JSON.parse(fs.readFileSync(f, 'utf8'));
+  // 兼容旧数据：缺少复核等字段的批注补默认值，保证旧文稿仍能打开
+  doc.annotations = Array.isArray(doc.annotations) ? doc.annotations : [];
+  for (const a of doc.annotations) {
+    if (a.review === undefined) a.review = null;
+    if (!Array.isArray(a.candidates)) a.candidates = [];
+  }
+  return doc;
 }
 
 function saveDoc(doc) {
+  // 写盘前统一核对复核结论：任一绑定值（新稿全文、批注原文与内容、
+  // 迁移状态、新区间）已变化的结论自动作废，避免旧核准误用于新位置；
+  // 绑定值不变（如重复迁移得到完全相同的结果）时结论保留。
+  reconcileReviews(doc);
   doc.updatedAt = new Date().toISOString();
   fs.writeFileSync(docFile(doc.id), JSON.stringify(doc, null, 2));
 }
@@ -45,6 +63,7 @@ function summary(doc) {
     pendingCount: doc.annotations.filter((a) => a.status === 'pending').length,
     hasOldText: Boolean(doc.oldText),
     hasNewText: Boolean(doc.newText),
+    reviewStats: reviewStats(doc.annotations),
   };
 }
 
@@ -57,11 +76,15 @@ function resetMigration(a) {
 }
 
 /**
- * 返回给前端的文稿视图：附带按当前位置即时计算的重叠冲突组。
+ * 返回给前端的文稿视图：附带按当前位置即时计算的重叠冲突组与当前有效的复核统计。
  * 派生数据不写入磁盘，每次迁移、人工定位或任何位置变动后随响应重新计算。
  */
 function docJson(doc) {
-  return { ...doc, overlapGroups: computeOverlapGroups(doc.annotations) };
+  return {
+    ...doc,
+    overlapGroups: computeOverlapGroups(doc.annotations),
+    reviewStats: reviewStats(doc.annotations),
+  };
 }
 
 function notFound(res) {
@@ -235,6 +258,42 @@ app.put('/api/documents/:id/annotations/:aid/position', (req, res) => {
   a.newEnd = end;
   a.status = 'manual';
   a.reason = 'human';
+  saveDoc(doc);
+  res.json(docJson(doc));
+});
+
+// 人工复核签收：仅已定位/人工指定的批注可标记「已核准 / 需调整」，
+// 结论绑定签署当时的新稿全文、批注原文与内容、迁移状态及新区间
+app.put('/api/documents/:id/annotations/:aid/review', (req, res) => {
+  const doc = loadDoc(req.params.id);
+  if (!doc) return notFound(res);
+  const a = doc.annotations.find((x) => x.id === req.params.aid);
+  if (!a) return res.status(404).json({ error: '批注不存在' });
+  if (!isReviewable(a)) {
+    return res.status(400).json({ error: '待处理或未迁移的批注不能复核，请先定位' });
+  }
+  const { verdict, note } = req.body || {};
+  if (!VERDICTS.includes(verdict)) {
+    return res.status(400).json({ error: '复核结论必须是 approved 或 needs_adjustment' });
+  }
+  a.review = {
+    verdict,
+    note: String(note || '').trim(),
+    reviewedAt: new Date().toISOString(),
+    binding: bindingOf(doc, a),
+  };
+  saveDoc(doc);
+  res.json(docJson(doc));
+});
+
+// 撤销复核结论
+app.delete('/api/documents/:id/annotations/:aid/review', (req, res) => {
+  const doc = loadDoc(req.params.id);
+  if (!doc) return notFound(res);
+  const a = doc.annotations.find((x) => x.id === req.params.aid);
+  if (!a) return res.status(404).json({ error: '批注不存在' });
+  if (!a.review) return res.status(404).json({ error: '该批注尚无复核结论' });
+  a.review = null;
   saveDoc(doc);
   res.json(docJson(doc));
 });
